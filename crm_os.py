@@ -1,10 +1,18 @@
+import os
+
 import streamlit as st
-import sqlite3
 import pandas as pd
 import math
 from datetime import datetime, date, timedelta
 from fpdf import FPDF
 import unicodedata
+from dotenv import load_dotenv
+from supabase import create_client
+
+# Carrega variáveis de ambiente do arquivo .env (se existir)
+# (usa caminho relativo ao próprio script, para garantir que funcione mesmo se executado de outro diretório)
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path)
 
 # ==========================================
 # CONFIGURAÇÃO DE ESTÉTICA CLEAN
@@ -17,51 +25,144 @@ def check_success_message():
         del st.session_state['sucesso']
 
 # ==========================================
-# CONEXÃO E BANCO DE DADOS (COM AGENDAMENTOS)
+# CONEXÃO COM SUPABASE (PostgreSQL)
 # ==========================================
-def get_db_connection():
-    conn = sqlite3.connect('crm_horas.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Defina SUPABASE_URL e SUPABASE_KEY como variáveis de ambiente antes de executar este app.")
+    st.error(f"Caminho .env esperado: {dotenv_path}")
+    st.error(f"SUPABASE_URL={SUPABASE_URL!r}, SUPABASE_KEY={'***' if SUPABASE_KEY else None}")
+    st.stop()
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY, valor_hora REAL, imposto_perc REAL)''')
-    c.execute("SELECT COUNT(*) FROM config")
-    if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO config (valor_hora, imposto_perc) VALUES (150.0, 10.0)")
-        
-    c.execute('''CREATE TABLE IF NOT EXISTS clientes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, empresa_mae_id INTEGER,
-                    FOREIGN KEY(empresa_mae_id) REFERENCES clientes(id))''')
-                    
-    c.execute('''CREATE TABLE IF NOT EXISTS ordens_servico (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER, solicitante TEXT,
-                    tipo TEXT, data_os DATE, minutos_reais INTEGER, minutos_cobrados INTEGER, historico TEXT,
-                    FOREIGN KEY(cliente_id) REFERENCES clientes(id))''')
-                    
-    c.execute('''CREATE TABLE IF NOT EXISTS agendamentos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER, titulo TEXT,
-                    data_agendada DATE, descricao TEXT, status TEXT DEFAULT 'Pendente',
-                    FOREIGN KEY(cliente_id) REFERENCES clientes(id))''')
-    conn.commit()
-    conn.close()
+    # Garante que exista uma configuração padrão
+    try:
+        res = supabase.table("config").select("*").limit(1).execute()
+    except Exception as e:
+        msg = str(e)
+        if "Could not find the table" in msg or "PGRST205" in msg:
+            st.error("Tabela necessária não encontrada no Supabase. Crie as tabelas esperadas (config, clientes, ordens_servico, agendamentos).")
+            st.error("Use o SQL recomendado no painel Supabase -> SQL Editor.")
+        else:
+            st.error("Erro ao conectar ao Supabase. Verifique SUPABASE_URL/SUPABASE_KEY e se o serviço está ativo.")
+            st.error(f"SUPABASE_URL: {SUPABASE_URL!r}")
+            st.error(f"SUPABASE_KEY definida: {bool(SUPABASE_KEY)}")
+            st.error(f"Erro original: {type(e).__name__}: {e}")
+        st.stop()
+
+    if not getattr(res, 'data', None):
+        supabase.table("config").insert({"valor_hora": 150.0, "imposto_perc": 10.0}).execute()
 
 init_db()
+
+
+def get_agendamento_by_id(ag_id):
+    try:
+        res = supabase.table("agendamentos").select("*").eq("id", ag_id).single().execute()
+    except Exception:
+        return None
+    return getattr(res, 'data', None)
 
 # ==========================================
 # FUNÇÕES AUXILIARES E REGRAS DE NEGÓCIO
 # ==========================================
 def calcular_minutos_cobrados(minutos_reais):
-    if minutos_reais <= 0: return 0
+    if minutos_reais <= 0:
+        return 0
     return math.ceil(minutos_reais / 15.0) * 15
 
+
 def get_config():
-    conn = get_db_connection()
-    config = conn.execute("SELECT * FROM config LIMIT 1").fetchone()
-    conn.close()
-    return config
+    try:
+        res = supabase.table("config").select("*").limit(1).execute()
+    except Exception as e:
+        st.error("Erro ao carregar configuração do Supabase. Verifique se a tabela 'config' existe.")
+        st.error(f"Erro original: {type(e).__name__}: {e}")
+        st.stop()
+
+    return res.data[0] if getattr(res, 'data', None) else {"valor_hora": 150.0, "imposto_perc": 10.0}
+
+
+def get_clientes_df():
+    try:
+        res = supabase.table("clientes").select("id, nome, empresa_mae_id").order("nome", desc=False).execute()
+    except Exception as e:
+        st.error("Erro ao carregar clientes do Supabase. Verifique se a tabela 'clientes' existe.")
+        st.error(f"Erro original: {type(e).__name__}: {e}")
+        st.stop()
+
+    df = pd.DataFrame(getattr(res, 'data', []) or [])
+    if not df.empty:
+        # Supabase pode retornar números como strings, então garantimos tipos consistentes para merge
+        df['id'] = pd.to_numeric(df['id'], errors='coerce').astype('Int64')
+        if 'empresa_mae_id' in df.columns:
+            df['empresa_mae_id'] = pd.to_numeric(df['empresa_mae_id'], errors='coerce').astype('Int64')
+    return df
+
+
+def get_agendamentos_df(status=None):
+    try:
+        query = supabase.table("agendamentos").select("*").order("data_agendada", desc=False)
+        if status:
+            query = query.eq("status", status)
+        res = query.execute()
+    except Exception as e:
+        st.error("Erro ao carregar agendamentos do Supabase. Verifique se a tabela 'agendamentos' existe.")
+        st.error(f"Erro original: {type(e).__name__}: {e}")
+        st.stop()
+
+    return pd.DataFrame(getattr(res, 'data', []) or [])
+
+
+def get_ordens_servico_df():
+    try:
+        res = supabase.table("ordens_servico").select("*").order("data_os", desc=True).order("id", desc=True).execute()
+    except Exception as e:
+        st.error("Erro ao carregar ordens de serviço do Supabase. Verifique se a tabela 'ordens_servico' existe.")
+        st.error(f"Erro original: {type(e).__name__}: {e}")
+        st.stop()
+
+    data = getattr(res, 'data', []) or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        # Garante colunas mínimas para evitar KeyError em código que espera essas colunas
+        return pd.DataFrame(columns=['id', 'cliente_id', 'solicitante', 'tipo', 'data_os', 'minutos_reais', 'minutos_cobrados', 'historico'])
+
+    # Normaliza tipos para evitar np.int64 em JSON
+    for col in ['id', 'cliente_id', 'minutos_reais', 'minutos_cobrados']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+
+    clientes = get_clientes_df()
+    if not clientes.empty and 'cliente_id' in df.columns:
+        df = df.merge(clientes[['id', 'nome']], left_on='cliente_id', right_on='id', how='left', suffixes=('', '_cliente'))
+        # Garante coluna usada em vários locais
+        df['Cliente'] = df.get('nome', '')
+
+    # Garantir colunas mínimas esperadas pelo restante do app
+    if 'nome' not in df.columns:
+        df['nome'] = ''
+    return df
+
+
+def get_os_by_id(os_id):
+    try:
+        res = supabase.table("ordens_servico").select("*").eq("id", os_id).single().execute()
+    except Exception:
+        return None
+    return getattr(res, 'data', None)
+
+
+def get_cliente_by_id(cliente_id):
+    try:
+        res = supabase.table("clientes").select("*").eq("id", cliente_id).single().execute()
+    except Exception:
+        return None
+    return getattr(res, 'data', None)
 
 def formatar_horas(minutos):
     return f"{int(minutos // 60)}h {int(minutos % 60):02d}m"
@@ -129,37 +230,32 @@ menu = st.sidebar.radio("Navegação",[
 if menu == "Visão Geral (Dashboard)":
     st.title("📊 Visão Geral do Mês Atual")
     mes_atual = datetime.now().strftime('%Y-%m')
-    
-    conn = get_db_connection()
-    query = f"""
-        SELECT o.id, c.nome as Cliente, o.data_os, o.tipo, o.minutos_cobrados, o.historico 
-        FROM ordens_servico o
-        JOIN clientes c ON o.cliente_id = c.id
-        WHERE strftime('%Y-%m', o.data_os) = '{mes_atual}'
-        ORDER BY o.data_os DESC, o.id DESC
-    """
-    df_os = pd.read_sql_query(query, conn)
+
+    df_os = get_ordens_servico_df()
+    if not df_os.empty:
+        df_os['data_os'] = pd.to_datetime(df_os['data_os'])
+        df_os = df_os[df_os['data_os'].dt.strftime('%Y-%m') == mes_atual]
+
     config = get_config()
-    conn.close()
-    
+
     if df_os.empty:
         st.info("Nenhuma Ordem de Serviço lançada neste mês.")
     else:
-        df_os['data_os'] = pd.to_datetime(df_os['data_os']).dt.strftime('%d/%m/%Y') # Formatando datas DD/MM/AAAA
+        df_os['data_os'] = df_os['data_os'].dt.strftime('%d/%m/%Y')  # Formatando datas DD/MM/AAAA
         total_minutos = df_os['minutos_cobrados'].sum()
         valor_bruto_total = (total_minutos / 60.0) * config['valor_hora']
         valor_liquido_total = valor_bruto_total - (valor_bruto_total * (config['imposto_perc'] / 100))
         cliente_campeao = df_os.groupby('Cliente')['minutos_cobrados'].sum().idxmax()
-        
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("⏱️ Horas Mês", formatar_horas(total_minutos))
         col2.metric("💰 Bruto", f"R$ {valor_bruto_total:,.2f}")
         col3.metric("💵 Líquido", f"R$ {valor_liquido_total:,.2f}")
         col4.metric("🏆 Top Cliente", cliente_campeao)
-        
+
         st.write("---")
         aba1, aba2, aba3 = st.tabs(["📋 Resumo por Cliente", "📈 Gráficos", "🔍 Extrato Detalhado Mensal"])
-        
+
         with aba1:
             df_ag = df_os.groupby('Cliente')['minutos_cobrados'].sum().reset_index()
             df_ag['Horas Totais'] = df_ag['minutos_cobrados'].apply(formatar_horas)
@@ -167,7 +263,7 @@ if menu == "Visão Geral (Dashboard)":
             df_ag['Faturamento Líquido'] = df_ag['Faturamento Bruto'] * (1 - (config['imposto_perc']/100))
             df_display = df_ag[['Cliente', 'Horas Totais', 'Faturamento Bruto', 'Faturamento Líquido']].copy()
             st.dataframe(df_display.style.format({'Faturamento Bruto': 'R$ {:.2f}', 'Faturamento Líquido': 'R$ {:.2f}'}), use_container_width=True, hide_index=True)
-            
+
         with aba2:
             st.bar_chart(data=df_ag, x='Cliente', y='Faturamento Bruto', use_container_width=True)
 
@@ -182,15 +278,15 @@ if menu == "Visão Geral (Dashboard)":
 elif menu == "📅 Agendamentos":
     st.title("📅 Gestão de Agendamentos e Projetos")
     check_success_message()
-    conn = get_db_connection()
-    clientes = pd.read_sql_query("SELECT id, nome FROM clientes ORDER BY nome", conn)
-    
+
+    clientes = get_clientes_df()
+
     if clientes.empty:
         st.warning("Cadastre um cliente primeiro.")
     else:
         aba_novo, aba_pend, aba_fin = st.tabs(["➕ Novo Agendamento", "⏳ Pendentes (Gerar OS)", "✅ Finalizados"])
         opcoes_clientes = dict(zip(clientes.nome, clientes.id))
-        
+
         with aba_novo:
             with st.form("form_agendamento", clear_on_submit=True):
                 c1, c2 = st.columns(2)
@@ -198,66 +294,90 @@ elif menu == "📅 Agendamentos":
                 titulo = c2.text_input("Título / Assunto da Tarefa")
                 data_ag = st.date_input("Data do Agendamento", date.today(), format="DD/MM/YYYY")
                 desc = st.text_area("Descrição detalhada")
-                
+
                 if st.form_submit_button("Salvar Agendamento", type="primary"):
-                    conn.execute("INSERT INTO agendamentos (cliente_id, titulo, data_agendada, descricao) VALUES (?, ?, ?, ?)",
-                                 (opcoes_clientes[cli_sel], titulo, data_ag.strftime('%Y-%m-%d'), desc))
-                    conn.commit()
+                    cliente_id_val = int(opcoes_clientes[cli_sel])
+                    supabase.table("agendamentos").insert({
+                        "cliente_id": cliente_id_val,
+                        "titulo": titulo,
+                        "data_agendada": data_ag.strftime('%Y-%m-%d'),
+                        "descricao": desc,
+                        "status": "Pendente",
+                    }).execute()
                     st.session_state['sucesso'] = "Agendamento salvo com sucesso!"
                     st.rerun()
-                    
+
         with aba_pend:
-            df_pend = pd.read_sql_query("SELECT a.id, c.nome as Cliente, a.titulo, a.data_agendada, a.descricao FROM agendamentos a JOIN clientes c ON a.cliente_id = c.id WHERE a.status = 'Pendente' ORDER BY a.data_agendada ASC", conn)
+            df_pend = get_agendamentos_df(status="Pendente")
             if df_pend.empty:
                 st.info("Nenhum agendamento pendente.")
             else:
+                df_pend = df_pend.merge(
+                    clientes[['id', 'nome']],
+                    left_on='cliente_id',
+                    right_on='id',
+                    how='left',
+                    suffixes=('', '_cliente'),
+                )
+                df_pend.rename(columns={'nome': 'Cliente'}, inplace=True)
                 df_pend['data_agendada'] = pd.to_datetime(df_pend['data_agendada']).dt.strftime('%d/%m/%Y')
                 st.dataframe(df_pend[['data_agendada', 'Cliente', 'titulo', 'descricao']], use_container_width=True, hide_index=True)
-                
+
                 st.markdown("#### 🚀 Transformar Agendamento em OS")
-                opcoes_pend = {f"{row['data_agendada']} | {row['Cliente']} - {row['titulo']}": row['id'] for _, row in df_pend.iterrows()}
+                opcoes_pend = {
+                    f"{row['data_agendada']} | {row['Cliente']} - {row['titulo']}": (
+                        row.get('id') or row.get('id_x') or row.get('id_y')
+                    )
+                    for _, row in df_pend.iterrows()
+                }
                 ag_selecionado = st.selectbox("Selecione o Agendamento para Finalizar", list(opcoes_pend.keys()))
-                
+
                 if ag_selecionado:
                     ag_id = opcoes_pend[ag_selecionado]
-                    ag_info = conn.execute("SELECT * FROM agendamentos WHERE id = ?", (ag_id,)).fetchone()
-                    
+                    ag_info = get_agendamento_by_id(ag_id)
+
                     with st.form("form_gerar_os"):
                         st.info("Preencha os dados reais de tempo para gerar a OS e finalizar o agendamento.")
                         c_h1, c_h2, c_p = st.columns(3)
                         hora_inicio = c_h1.time_input("Hora de Início", step=900)
                         hora_fim = c_h2.time_input("Hora de Fim", step=900)
                         pausa = c_p.number_input("Pausa (min)", min_value=0, step=15)
-                        
+
                         solicitante = st.text_input("Solicitante")
                         tipo = st.radio("Tipo", ["Home Office", "Presencial"], horizontal=True)
                         hist = st.text_area("Histórico Final da OS", value=f"Ref. Agendamento: {ag_info['titulo']}\n{ag_info['descricao']}")
-                        
+
                         if st.form_submit_button("Gerar OS e Concluir Agendamento", type="primary"):
                             t_inicio = datetime.combine(date.today(), hora_inicio)
                             t_fim = datetime.combine(date.today(), hora_fim)
                             if t_fim > t_inicio:
                                 min_reais = ((t_fim - t_inicio).total_seconds() / 60) - pausa
                                 min_cobrados = calcular_minutos_cobrados(min_reais)
-                                
-                                conn.execute("""INSERT INTO ordens_servico (cliente_id, solicitante, tipo, data_os, minutos_reais, minutos_cobrados, historico)
-                                                VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                                             (ag_info['cliente_id'], solicitante, tipo, date.today().strftime('%Y-%m-%d'), min_reais, min_cobrados, hist))
-                                conn.execute("UPDATE agendamentos SET status = 'Finalizado' WHERE id = ?", (ag_id,))
-                                conn.commit()
+
+                                supabase.table("ordens_servico").insert({
+                                    "cliente_id": int(ag_info['cliente_id']),
+                                    "solicitante": solicitante,
+                                    "tipo": tipo,
+                                    "data_os": date.today().strftime('%Y-%m-%d'),
+                                    "minutos_reais": int(round(min_reais)),
+                                    "minutos_cobrados": int(min_cobrados),
+                                    "historico": hist,
+                                }).execute()
+                                supabase.table("agendamentos").update({"status": "Finalizado"}).eq("id", ag_id).execute()
                                 st.session_state['sucesso'] = "OS Gerada e Agendamento Finalizado!"
                                 st.rerun()
                             else:
                                 st.error("A hora final deve ser maior que a inicial.")
-                                
+
         with aba_fin:
-            df_fin = pd.read_sql_query("SELECT a.id, c.nome as Cliente, a.titulo, a.data_agendada FROM agendamentos a JOIN clientes c ON a.cliente_id = c.id WHERE a.status = 'Finalizado' ORDER BY a.data_agendada DESC", conn)
+            df_fin = get_agendamentos_df(status="Finalizado")
             if not df_fin.empty:
+                df_fin = df_fin.merge(clientes[['id', 'nome']], left_on='cliente_id', right_on='id', how='left')
+                df_fin.rename(columns={'nome': 'Cliente'}, inplace=True)
                 df_fin['data_agendada'] = pd.to_datetime(df_fin['data_agendada']).dt.strftime('%d/%m/%Y')
                 st.dataframe(df_fin[['data_agendada', 'Cliente', 'titulo']], use_container_width=True, hide_index=True)
             else:
                 st.info("Nenhum agendamento finalizado.")
-    conn.close()
 
 # ==========================================
 # PÁGINA 3: ORDENS DE SERVIÇO
@@ -265,15 +385,14 @@ elif menu == "📅 Agendamentos":
 elif menu == "🛠️ Ordens de Serviço":
     st.title("🛠️ Gestão de Ordens de Serviço")
     check_success_message()
-    
-    conn = get_db_connection()
-    clientes = pd.read_sql_query("SELECT id, nome FROM clientes ORDER BY nome", conn)
-    
+
+    clientes = get_clientes_df()
+
     if clientes.empty:
         st.warning("Cadastre um cliente primeiro.")
     else:
         aba_lancar, aba_historico = st.tabs(["📝 Lançar Nova OS", "🔍 Histórico, Edição e PDF"])
-        
+
         with aba_lancar:
             col_form, col_recentes = st.columns([1.5, 1])
             with col_form:
@@ -282,11 +401,11 @@ elif menu == "🛠️ Ordens de Serviço":
                     c1, c2 = st.columns(2)
                     cli_sel = c1.selectbox("Cliente / Empresa", list(opcoes_clientes.keys()))
                     solic = c2.text_input("Solicitante")
-                    
+
                     c3, c4 = st.columns(2)
                     tipo_at = c3.radio("Tipo", ["Home Office", "Presencial"], horizontal=True)
                     data_os = c4.date_input("Data", date.today(), format="DD/MM/YYYY")
-                    
+
                     st.markdown("##### Tempo")
                     c_h1, c_h2, c_p = st.columns(3)
                     agora = datetime.now()
@@ -306,10 +425,15 @@ elif menu == "🛠️ Ordens de Serviço":
                             min_reais = ((t_out - t_in).total_seconds() / 60) - pausa
                             if min_reais > 0:
                                 min_cobrados = calcular_minutos_cobrados(min_reais)
-                                conn.execute("""INSERT INTO ordens_servico (cliente_id, solicitante, tipo, data_os, minutos_reais, minutos_cobrados, historico)
-                                                VALUES (?, ?, ?, ?, ?, ?, ?)""", 
-                                             (opcoes_clientes[cli_sel], solic, tipo_at, data_os.strftime('%Y-%m-%d'), min_reais, min_cobrados, hist))
-                                conn.commit()
+                                supabase.table("ordens_servico").insert({
+                                    "cliente_id": int(opcoes_clientes[cli_sel]),
+                                    "solicitante": solic,
+                                    "tipo": tipo_at,
+                                    "data_os": data_os.strftime('%Y-%m-%d'),
+                                    "minutos_reais": int(round(min_reais)),
+                                    "minutos_cobrados": int(min_cobrados),
+                                    "historico": hist,
+                                }).execute()
                                 st.session_state['sucesso'] = f"OS Lançada! Faturado: {formatar_horas(min_cobrados)}"
                                 st.rerun()
                             else:
@@ -319,17 +443,17 @@ elif menu == "🛠️ Ordens de Serviço":
 
             with col_recentes:
                 st.markdown("##### 🕒 Últimas 5 OS")
-                df_rec = pd.read_sql_query("SELECT c.nome, o.data_os, o.minutos_cobrados FROM ordens_servico o JOIN clientes c ON o.cliente_id = c.id ORDER BY o.id DESC LIMIT 5", conn)
+                df_rec = get_ordens_servico_df().head(5)
                 if not df_rec.empty:
                     df_rec['Tempo'] = df_rec['minutos_cobrados'].apply(formatar_horas)
                     df_rec['Data'] = pd.to_datetime(df_rec['data_os']).dt.strftime('%d/%m/%Y')
                     st.dataframe(df_rec[['Data', 'nome', 'Tempo']], use_container_width=True, hide_index=True)
                 else:
                     st.info("Nenhuma OS lançada.")
-                    
+
         with aba_historico:
             st.markdown("Selecione uma OS existente para visualizar, gerar PDF, editar ou excluir.")
-            todas_os = pd.read_sql_query("SELECT o.id, c.nome, o.data_os FROM ordens_servico o JOIN clientes c ON o.cliente_id = c.id ORDER BY o.data_os DESC, o.id DESC", conn)
+            todas_os = get_ordens_servico_df()[['id', 'nome', 'data_os']].copy()
 
             if 'os_selecionada' not in st.session_state:
                 st.session_state['os_selecionada'] = None
@@ -388,7 +512,10 @@ elif menu == "🛠️ Ordens de Serviço":
 
                     if st.session_state['os_selecionada']:
                         id_os = int(st.session_state['os_selecionada'])
-                        os_info = conn.execute("SELECT o.*, c.nome as cliente_nome FROM ordens_servico o JOIN clientes c ON o.cliente_id = c.id WHERE o.id = ?", (id_os,)).fetchone()
+                        os_info = get_os_by_id(id_os)
+                        if os_info:
+                            cliente = get_cliente_by_id(os_info['cliente_id'])
+                            os_info['cliente_nome'] = cliente['nome'] if cliente else ''
 
                         if not os_info:
                             st.warning("A OS selecionada não foi encontrada (já pode ter sido excluída). Selecione outra OS.")
@@ -441,24 +568,23 @@ elif menu == "🛠️ Ordens de Serviço":
                                 
                                 if atualizar:
                                     id_novo_cliente = clientes[clientes['nome'] == cli_edit]['id'].values[0]
-                                    conn.execute("""UPDATE ordens_servico SET cliente_id=?, solicitante=?, tipo=?, data_os=?, minutos_cobrados=?, historico=? WHERE id=?""",
-                                                 (id_novo_cliente, solic_edit, tipo_edit, data_edit.strftime('%Y-%m-%d'), min_edit, hist_edit, os_info['id']))
-                                    conn.commit()
+                                    supabase.table("ordens_servico").update({
+                                        "cliente_id": id_novo_cliente,
+                                        "solicitante": solic_edit,
+                                        "tipo": tipo_edit,
+                                        "data_os": data_edit.strftime('%Y-%m-%d'),
+                                        "minutos_cobrados": min_edit,
+                                        "historico": hist_edit,
+                                    }).eq("id", os_info['id']).execute()
                                     st.session_state['sucesso'] = "OS Atualizada com sucesso!"
                                     st.rerun()
                                     
                                 if excluir:
-                                    conn.execute("DELETE FROM ordens_servico WHERE id=?", (os_info['id'],))
-                                    # Se a tabela ficar vazia, resetar o contador AUTOINCREMENT (sqlite_sequence)
-                                    total_os = conn.execute("SELECT COUNT(*) FROM ordens_servico").fetchone()[0]
-                                    if total_os == 0:
-                                        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'ordens_servico'")
-                                    conn.commit()
+                                    supabase.table("ordens_servico").delete().eq("id", os_info['id']).execute()
                                     st.session_state['sucesso'] = "OS Excluída com sucesso!"
                                     st.rerun()
             else:
                 st.info("Nenhuma OS registrada no banco de dados.")
-    conn.close()
 
 # ==========================================
 # PÁGINA 4: CLIENTES
@@ -466,11 +592,11 @@ elif menu == "🛠️ Ordens de Serviço":
 elif menu == "👥 Meus Clientes":
     st.title("👥 Gestão de Clientes")
     check_success_message()
-    conn = get_db_connection()
-    clientes_ex = pd.read_sql_query("SELECT id, nome FROM clientes ORDER BY nome", conn)
-    
+
+    clientes_ex = get_clientes_df()
+
     aba1, aba2 = st.tabs(["📋 Cadastrar / Listar", "✏️ Editar / Excluir"])
-    
+
     with aba1:
         col1, col2 = st.columns([1, 1.5])
         with col1:
@@ -480,30 +606,48 @@ elif menu == "👥 Meus Clientes":
                 if not clientes_ex.empty:
                     opcoes_mae.update(dict(zip(clientes_ex.nome, clientes_ex.id)))
                 empresa_mae = st.selectbox("Pertence ao grupo de?", list(opcoes_mae.keys()))
-                
+
                 if st.form_submit_button("Salvar Cliente", type="primary", use_container_width=True) and nome_cliente:
-                    conn.execute("INSERT INTO clientes (nome, empresa_mae_id) VALUES (?, ?)", (nome_cliente, opcoes_mae[empresa_mae]))
-                    conn.commit()
+                    empresa_mae_id_val = opcoes_mae[empresa_mae]
+                    if empresa_mae_id_val is not None:
+                        empresa_mae_id_val = int(empresa_mae_id_val)
+
+                    supabase.table("clientes").insert({
+                        "nome": nome_cliente,
+                        "empresa_mae_id": empresa_mae_id_val,
+                    }).execute()
                     st.session_state['sucesso'] = f"Cliente '{nome_cliente}' salvo!"
                     st.rerun()
-                    
+
         with col2:
-            df_lista_cli = pd.read_sql_query("SELECT c1.nome as Empresa, IFNULL(c2.nome, 'MATRIZ') as 'Vinculada à' FROM clientes c1 LEFT JOIN clientes c2 ON c1.empresa_mae_id = c2.id ORDER BY c1.nome", conn)
-            st.dataframe(df_lista_cli, use_container_width=True, hide_index=True)
+            if clientes_ex.empty:
+                st.info("Nenhum cliente cadastrado ainda.")
+            else:
+                df_lista_cli = clientes_ex.merge(
+                    clientes_ex[['id', 'nome']],
+                    left_on='empresa_mae_id',
+                    right_on='id',
+                    how='left',
+                    suffixes=('', '_mae')
+                )
+                df_lista_cli['Vinculada à'] = df_lista_cli['nome_mae'].fillna('MATRIZ')
+                df_lista_cli = df_lista_cli[['nome', 'Vinculada à']].rename(columns={'nome': 'Empresa'})
+                st.dataframe(df_lista_cli, use_container_width=True, hide_index=True)
 
     with aba2:
         if not clientes_ex.empty:
             cli_ids = clientes_ex['id'].tolist()
             cli_nomes = clientes_ex['nome'].tolist()
             sel_id = st.selectbox("Selecione o cliente", cli_ids, format_func=lambda i: cli_nomes[cli_ids.index(i)])
-            cli_info = conn.execute("SELECT * FROM clientes WHERE id = ?", (sel_id,)).fetchone()
+            cli_info = get_cliente_by_id(sel_id)
 
             if cli_info:
                 with st.form("form_edicao_cliente"):
                     n_edit = st.text_input("Nome", value=cli_info['nome'])
                     op_edit = {"Nenhuma (É a Empresa Mãe)": None}
                     for idx, nm in zip(clientes_ex['id'], clientes_ex['nome']):
-                        if idx != cli_info['id']: op_edit[nm] = idx
+                        if idx != cli_info['id']:
+                            op_edit[nm] = idx
 
                     m_keys, m_vals = list(op_edit.keys()), list(op_edit.values())
                     idx_default = m_vals.index(cli_info['empresa_mae_id']) if cli_info['empresa_mae_id'] in m_vals else 0
@@ -511,18 +655,22 @@ elif menu == "👥 Meus Clientes":
 
                     b1, b2 = st.columns(2)
                     if b1.form_submit_button("Atualizar Cliente", type="primary", use_container_width=True):
-                        conn.execute("UPDATE clientes SET nome=?, empresa_mae_id=? WHERE id=?", (n_edit, op_edit[mae_edit], cli_info['id']))
-                        conn.commit()
+                        empresa_mae_id_val = op_edit[mae_edit]
+                        if empresa_mae_id_val is not None:
+                            empresa_mae_id_val = int(empresa_mae_id_val)
+
+                        supabase.table("clientes").update({
+                            "nome": n_edit,
+                            "empresa_mae_id": empresa_mae_id_val,
+                        }).eq("id", cli_info['id']).execute()
                         st.session_state['sucesso'] = "Cliente atualizado!"
                         st.rerun()
 
                     if b2.form_submit_button("🗑️ Excluir Cliente", use_container_width=True):
-                        conn.execute("UPDATE clientes SET empresa_mae_id = NULL WHERE empresa_mae_id = ?", (cli_info['id'],))
-                        conn.execute("DELETE FROM clientes WHERE id = ?", (cli_info['id'],))
-                        conn.commit()
+                        supabase.table("clientes").update({"empresa_mae_id": None}).eq("empresa_mae_id", cli_info['id']).execute()
+                        supabase.table("clientes").delete().eq("id", cli_info['id']).execute()
                         st.session_state['sucesso'] = "Cliente excluído!"
                         st.rerun()
-    conn.close()
 
 # ==========================================
 # PÁGINA 5: CONFIGURAÇÕES
@@ -538,9 +686,9 @@ elif menu == "⚙️ Configurações":
             valor_h = st.number_input("Valor Hora (R$)", min_value=0.0, value=config['valor_hora'], step=10.0)
             imposto = st.number_input("Imposto (%)", min_value=0.0, max_value=100.0, value=config['imposto_perc'], step=1.0)
             if st.form_submit_button("Atualizar Valores", type="primary", use_container_width=True):
-                conn = get_db_connection()
-                conn.execute("UPDATE config SET valor_hora = ?, imposto_perc = ? WHERE id = 1", (valor_h, imposto))
-                conn.commit()
-                conn.close()
+                supabase.table("config").update({
+                    "valor_hora": valor_h,
+                    "imposto_perc": imposto,
+                }).eq("id", 1).execute()
                 st.session_state['sucesso'] = "Configurações atualizadas!"
                 st.rerun()
