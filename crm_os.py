@@ -6,13 +6,19 @@ import math
 from datetime import datetime, date, timedelta
 from fpdf import FPDF
 import unicodedata
-from dotenv import load_dotenv
+
+# dotenv pode não existir em Streamlit Cloud, então importamos com fallback
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 from supabase import create_client
 
-# Carrega variáveis de ambiente do arquivo .env (se existir)
-# (usa caminho relativo ao próprio script, para garantir que funcione mesmo se executado de outro diretório)
-dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(dotenv_path)
+# Carrega variáveis de ambiente do arquivo .env (se existir e se a biblioteca estiver disponível)
+if load_dotenv is not None:
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    load_dotenv(dotenv_path)
 
 # ==========================================
 # CONFIGURAÇÃO DE ESTÉTICA CLEAN
@@ -27,13 +33,20 @@ def check_success_message():
 # ==========================================
 # CONEXÃO COM SUPABASE (PostgreSQL)
 # ==========================================
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Preferir Streamlit Secrets (Cloud) quando disponível, caso contrário usar variáveis de ambiente
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") if st.secrets else None
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") if st.secrets else None
+
+if not SUPABASE_URL:
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+if not SUPABASE_KEY:
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("Defina SUPABASE_URL e SUPABASE_KEY como variáveis de ambiente antes de executar este app.")
-    st.error(f"Caminho .env esperado: {dotenv_path}")
-    st.error(f"SUPABASE_URL={SUPABASE_URL!r}, SUPABASE_KEY={'***' if SUPABASE_KEY else None}")
+    st.error("Defina SUPABASE_URL e SUPABASE_KEY como variáveis de ambiente ou em Streamlit Secrets antes de executar este app.")
+    if load_dotenv is not None:
+        st.error(f"Caminho .env esperado: {dotenv_path}")
+    st.error(f"SUPABASE_URL={SUPABASE_URL!r}, SUPABASE_KEY definida: {bool(SUPABASE_KEY)}")
     st.stop()
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
