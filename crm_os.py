@@ -90,9 +90,18 @@ def get_agendamento_by_id(ag_id):
 # FUNÇÕES AUXILIARES E REGRAS DE NEGÓCIO
 # ==========================================
 def calcular_minutos_cobrados(minutos_reais):
+    """Retorna os minutos faturados.
+
+    Antes, o sistema arredondava sempre para cima em múltiplos de 15 minutos, o que
+    fazia com que qualquer duração (mesmo maior que 15) fosse faturada como 15.
+
+    Agora, usamos o valor real (arredondado para o minuto mais próximo), mas ainda
+    garantimos que não seja negativo.
+    """
     if minutos_reais <= 0:
         return 0
-    return math.ceil(minutos_reais / 15.0) * 15
+    # Usamos o valor real do atendimento; arredondamos para o minuto mais próximo.
+    return int(round(minutos_reais))
 
 
 def get_config():
