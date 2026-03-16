@@ -1,3 +1,5 @@
 streamlit
 fpdf
 supabase
+python-dotenv
+pandas

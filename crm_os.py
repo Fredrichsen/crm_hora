@@ -34,8 +34,14 @@ def check_success_message():
 # CONEXÃO COM SUPABASE (PostgreSQL)
 # ==========================================
 # Preferir Streamlit Secrets (Cloud) quando disponível, caso contrário usar variáveis de ambiente
-SUPABASE_URL = st.secrets.get("SUPABASE_URL") if st.secrets else None
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") if st.secrets else None
+SUPABASE_URL = None
+SUPABASE_KEY = None
+try:
+    # Se não houver secrets.toml, essa chamada pode lançar StreamlitSecretNotFoundError
+    SUPABASE_URL = st.secrets.get("SUPABASE_URL")
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY")
+except Exception:
+    pass
 
 if not SUPABASE_URL:
     SUPABASE_URL = os.getenv("SUPABASE_URL")
