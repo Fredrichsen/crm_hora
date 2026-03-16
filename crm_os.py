@@ -586,20 +586,24 @@ elif menu == "🛠️ Ordens de Serviço":
                                 excluir = btn_c2.form_submit_button("🗑️ Excluir OS", use_container_width=True)
                                 
                                 if atualizar:
-                                    id_novo_cliente = clientes[clientes['nome'] == cli_edit]['id'].values[0]
+                                    # Garantir tipos nativos do Python para serialização JSON
+                                    id_novo_cliente = int(clientes[clientes['nome'] == cli_edit]['id'].values[0])
+                                    minutos_cobrados = int(min_edit)
+                                    os_id = int(os_info['id'])
+
                                     supabase.table("ordens_servico").update({
                                         "cliente_id": id_novo_cliente,
                                         "solicitante": solic_edit,
                                         "tipo": tipo_edit,
                                         "data_os": data_edit.strftime('%Y-%m-%d'),
-                                        "minutos_cobrados": min_edit,
+                                        "minutos_cobrados": minutos_cobrados,
                                         "historico": hist_edit,
-                                    }).eq("id", os_info['id']).execute()
+                                    }).eq("id", os_id).execute()
                                     st.session_state['sucesso'] = "OS Atualizada com sucesso!"
                                     st.rerun()
                                     
                                 if excluir:
-                                    supabase.table("ordens_servico").delete().eq("id", os_info['id']).execute()
+                                    supabase.table("ordens_servico").delete().eq("id", int(os_info['id'])).execute()
                                     st.session_state['sucesso'] = "OS Excluída com sucesso!"
                                     st.rerun()
             else:
