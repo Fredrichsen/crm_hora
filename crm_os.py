@@ -92,16 +92,37 @@ def get_agendamento_by_id(ag_id):
 def calcular_minutos_cobrados(minutos_reais):
     """Retorna os minutos faturados.
 
-    Antes, o sistema arredondava sempre para cima em múltiplos de 15 minutos, o que
-    fazia com que qualquer duração (mesmo maior que 15) fosse faturada como 15.
+    O faturamento é feito em blocos de 15 minutos (cobrança mínima de 15m).
+    Ex:
+      - 1..15m => 15m
+      - 16..30m => 30m
+      - 31..45m => 45m
+      - 46..60m => 60m
 
-    Agora, usamos o valor real (arredondado para o minuto mais próximo), mas ainda
-    garantimos que não seja negativo.
+    Isso evita cobranças fracionadas e deixa o resultado consistente.
     """
     if minutos_reais <= 0:
         return 0
-    # Usamos o valor real do atendimento; arredondamos para o minuto mais próximo.
-    return int(round(minutos_reais))
+    return int(math.ceil(minutos_reais / 15.0) * 15)
+
+
+def calcular_minutos_reais(hora_inicio, hora_fim, pausa=0):
+    """Calcula a duração em minutos entre dois horários.
+
+    - Aceita `datetime.time` para início/fim.
+    - Se `hora_fim` for anterior a `hora_inicio`, assume que passou da meia-noite.
+    - Subtrai o tempo de pausa (em minutos).
+    - Garante que o valor retornado não seja negativo.
+    """
+    start_minutes = hora_inicio.hour * 60 + hora_inicio.minute + hora_inicio.second / 60.0
+    end_minutes = hora_fim.hour * 60 + hora_fim.minute + hora_fim.second / 60.0
+
+    diff = end_minutes - start_minutes
+    if diff < 0:
+        diff += 24 * 60
+
+    diff -= pausa
+    return max(diff, 0)
 
 
 def get_config():
@@ -365,21 +386,19 @@ elif menu == "📅 Agendamentos":
                     ag_info = get_agendamento_by_id(ag_id)
 
                     with st.form("form_gerar_os"):
-                        st.info("Preencha os dados reais de tempo para gerar a OS e finalizar o agendamento.")
-                        c_h1, c_h2, c_p = st.columns(3)
-                        hora_inicio = c_h1.time_input("Hora de Início", step=900)
-                        hora_fim = c_h2.time_input("Hora de Fim", step=900)
-                        pausa = c_p.number_input("Pausa (min)", min_value=0, step=15)
+                        st.info("Informe o tempo total do serviço para gerar a OS (múltiplo de 15 minutos).")
+                        duracao = st.number_input("Tempo (min)", min_value=15, value=15, step=15)
+
+                        min_reais_preview = float(duracao)
+                        min_cobrados_preview = calcular_minutos_cobrados(min_reais_preview)
 
                         solicitante = st.text_input("Solicitante")
                         tipo = st.radio("Tipo", ["Home Office", "Presencial"], horizontal=True)
                         hist = st.text_area("Histórico Final da OS", value=f"Ref. Agendamento: {ag_info['titulo']}\n{ag_info['descricao']}")
 
                         if st.form_submit_button("Gerar OS e Concluir Agendamento", type="primary"):
-                            t_inicio = datetime.combine(date.today(), hora_inicio)
-                            t_fim = datetime.combine(date.today(), hora_fim)
-                            if t_fim > t_inicio:
-                                min_reais = ((t_fim - t_inicio).total_seconds() / 60) - pausa
+                            min_reais = float(duracao)
+                            if min_reais > 0:
                                 min_cobrados = calcular_minutos_cobrados(min_reais)
 
                                 supabase.table("ordens_servico").insert({
@@ -395,7 +414,7 @@ elif menu == "📅 Agendamentos":
                                 st.session_state['sucesso'] = "OS Gerada e Agendamento Finalizado!"
                                 st.rerun()
                             else:
-                                st.error("A hora final deve ser maior que a inicial.")
+                                st.error("A hora final deve ser maior que a inicial (ou a pausa é maior que a duração).")
 
         with aba_fin:
             df_fin = get_agendamentos_df(status="Finalizado")
@@ -435,39 +454,28 @@ elif menu == "🛠️ Ordens de Serviço":
                     data_os = c4.date_input("Data", date.today(), format="DD/MM/YYYY")
 
                     st.markdown("##### Tempo")
-                    c_h1, c_h2, c_p = st.columns(3)
-                    agora = datetime.now()
-                    min_base = (agora.minute // 15) * 15
-                    h_in = agora.replace(minute=min_base, second=0).time()
-                    h_out = (agora.replace(minute=min_base, second=0) + timedelta(minutes=15)).time()
+                    duracao = st.number_input("Tempo (min)", min_value=15, value=15, step=15)
 
-                    hora_inicio = c_h1.time_input("Início", value=h_in, step=900)
-                    hora_fim = c_h2.time_input("Fim", value=h_out, step=900)
-                    pausa = c_p.number_input("Pausa (min)", min_value=0, value=0, step=15)
-
+                    min_reais_preview = float(duracao)
+                    min_cobrados_preview = calcular_minutos_cobrados(min_reais_preview)
                     hist = st.text_area("Descrição")
                     if st.form_submit_button("Lançar OS", type="primary", use_container_width=True):
-                        t_in = datetime.combine(data_os, hora_inicio)
-                        t_out = datetime.combine(data_os, hora_fim)
-                        if t_out > t_in:
-                            min_reais = ((t_out - t_in).total_seconds() / 60) - pausa
-                            if min_reais > 0:
-                                min_cobrados = calcular_minutos_cobrados(min_reais)
-                                supabase.table("ordens_servico").insert({
-                                    "cliente_id": int(opcoes_clientes[cli_sel]),
-                                    "solicitante": solic,
-                                    "tipo": tipo_at,
-                                    "data_os": data_os.strftime('%Y-%m-%d'),
-                                    "minutos_reais": int(round(min_reais)),
-                                    "minutos_cobrados": int(min_cobrados),
-                                    "historico": hist,
-                                }).execute()
-                                st.session_state['sucesso'] = f"OS Lançada! Faturado: {formatar_horas(min_cobrados)}"
-                                st.rerun()
-                            else:
-                                st.error("Tempo de pausa excede o período trabalhado.")
+                        min_reais = float(duracao)
+                        if min_reais > 0:
+                            min_cobrados = calcular_minutos_cobrados(min_reais)
+                            supabase.table("ordens_servico").insert({
+                                "cliente_id": int(opcoes_clientes[cli_sel]),
+                                "solicitante": solic,
+                                "tipo": tipo_at,
+                                "data_os": data_os.strftime('%Y-%m-%d'),
+                                "minutos_reais": int(round(min_reais)),
+                                "minutos_cobrados": int(min_cobrados),
+                                "historico": hist,
+                            }).execute()
+                            st.session_state['sucesso'] = f"OS Lançada! Faturado: {formatar_horas(min_cobrados)}"
+                            st.rerun()
                         else:
-                            st.error("A hora de fim deve ser maior que a inicial.")
+                            st.error("A hora final deve ser maior que a inicial (ou a pausa é maior que a duração).")
 
             with col_recentes:
                 st.markdown("##### 🕒 Últimas 5 OS")
