@@ -33,11 +33,9 @@ def check_success_message():
 # ==========================================
 # CONEXÃO COM SUPABASE (PostgreSQL)
 # ==========================================
-# Preferir Streamlit Secrets (Cloud) quando disponível, caso contrário usar variáveis de ambiente
 SUPABASE_URL = None
 SUPABASE_KEY = None
 try:
-    # Se não houver secrets.toml, essa chamada pode lançar StreamlitSecretNotFoundError
     SUPABASE_URL = st.secrets.get("SUPABASE_URL")
     SUPABASE_KEY = st.secrets.get("SUPABASE_KEY")
 except Exception:
@@ -134,6 +132,18 @@ def get_config():
         st.stop()
 
     return res.data[0] if getattr(res, 'data', None) else {"valor_hora": 150.0, "imposto_perc": 10.0}
+
+
+def get_valor_imposto(config):
+    return float(config.get('imposto_valor', config.get('imposto_perc', 0.0)) or 0.0)
+
+
+def calcular_valor_liquido(valor_bruto, imposto_reais):
+    return max(float(valor_bruto) - float(imposto_reais), 0.0)
+
+
+def formatar_competencia(competencia):
+    return datetime.strptime(competencia, '%Y-%m').strftime('%m/%Y')
 
 
 def get_clientes_df():
@@ -277,23 +287,31 @@ menu = st.sidebar.radio("Navegação",[
 # PÁGINA 1: DASHBOARD
 # ==========================================
 if menu == "Visão Geral (Dashboard)":
-    st.title("📊 Visão Geral do Mês Atual")
-    mes_atual = datetime.now().strftime('%Y-%m')
+    st.title("📊 Visão Geral")
 
     df_os = get_ordens_servico_df()
-    if not df_os.empty:
-        df_os['data_os'] = pd.to_datetime(df_os['data_os'])
-        df_os = df_os[df_os['data_os'].dt.strftime('%Y-%m') == mes_atual]
-
     config = get_config()
+    imposto_fixo = get_valor_imposto(config)
 
     if df_os.empty:
-        st.info("Nenhuma Ordem de Serviço lançada neste mês.")
+        st.info("Nenhuma Ordem de Serviço lançada até o momento.")
     else:
+        df_os['data_os'] = pd.to_datetime(df_os['data_os'])
+        meses_disponiveis = sorted(df_os['data_os'].dt.strftime('%Y-%m').unique().tolist(), reverse=True)
+        mes_atual = datetime.now().strftime('%Y-%m')
+        indice_padrao = meses_disponiveis.index(mes_atual) if mes_atual in meses_disponiveis else 0
+        mes_selecionado = st.selectbox(
+            "Competência",
+            options=meses_disponiveis,
+            index=indice_padrao,
+            format_func=formatar_competencia,
+        )
+
+        df_os = df_os[df_os['data_os'].dt.strftime('%Y-%m') == mes_selecionado].copy()
         df_os['data_os'] = df_os['data_os'].dt.strftime('%d/%m/%Y')  # Formatando datas DD/MM/AAAA
         total_minutos = df_os['minutos_cobrados'].sum()
         valor_bruto_total = (total_minutos / 60.0) * config['valor_hora']
-        valor_liquido_total = valor_bruto_total - (valor_bruto_total * (config['imposto_perc'] / 100))
+        valor_liquido_total = calcular_valor_liquido(valor_bruto_total, imposto_fixo)
         cliente_campeao = df_os.groupby('Cliente')['minutos_cobrados'].sum().idxmax()
 
         col1, col2, col3, col4 = st.columns(4)
@@ -301,6 +319,7 @@ if menu == "Visão Geral (Dashboard)":
         col2.metric("💰 Bruto", f"R$ {valor_bruto_total:,.2f}")
         col3.metric("💵 Líquido", f"R$ {valor_liquido_total:,.2f}")
         col4.metric("🏆 Top Cliente", cliente_campeao)
+        st.caption(f"Imposto fixo (DAS): R$ {imposto_fixo:,.2f}")
 
         st.write("---")
         aba1, aba2, aba3 = st.tabs(["📋 Resumo por Cliente", "📈 Gráficos", "🔍 Extrato Detalhado Mensal"])
@@ -309,9 +328,16 @@ if menu == "Visão Geral (Dashboard)":
             df_ag = df_os.groupby('Cliente')['minutos_cobrados'].sum().reset_index()
             df_ag['Horas Totais'] = df_ag['minutos_cobrados'].apply(formatar_horas)
             df_ag['Faturamento Bruto'] = (df_ag['minutos_cobrados'] / 60.0) * config['valor_hora']
-            df_ag['Faturamento Líquido'] = df_ag['Faturamento Bruto'] * (1 - (config['imposto_perc']/100))
+            total_bruto_clientes = df_ag['Faturamento Bruto'].sum()
+            imposto_rateado = min(imposto_fixo, total_bruto_clientes)
+            if total_bruto_clientes > 0 and imposto_rateado > 0:
+                df_ag['Imposto Rateado'] = (df_ag['Faturamento Bruto'] / total_bruto_clientes) * imposto_rateado
+            else:
+                df_ag['Imposto Rateado'] = 0.0
+            df_ag['Faturamento Líquido'] = (df_ag['Faturamento Bruto'] - df_ag['Imposto Rateado']).clip(lower=0)
             df_display = df_ag[['Cliente', 'Horas Totais', 'Faturamento Bruto', 'Faturamento Líquido']].copy()
             st.dataframe(df_display.style.format({'Faturamento Bruto': 'R$ {:.2f}', 'Faturamento Líquido': 'R$ {:.2f}'}), use_container_width=True, hide_index=True)
+            st.caption("No resumo por cliente, o imposto fixo do mês é rateado proporcionalmente ao faturamento bruto.")
 
         with aba2:
             st.bar_chart(data=df_ag, x='Cliente', y='Faturamento Bruto', use_container_width=True)
@@ -719,12 +745,13 @@ elif menu == "⚙️ Configurações":
     st.title("⚙️ Configurações do Sistema")
     check_success_message()
     config = get_config()
+    imposto_atual = get_valor_imposto(config)
     
     col1, col2 = st.columns([1, 2])
     with col1:
         with st.form("form_config"):
             valor_h = st.number_input("Valor Hora (R$)", min_value=0.0, value=config['valor_hora'], step=10.0)
-            imposto = st.number_input("Imposto (%)", min_value=0.0, max_value=100.0, value=config['imposto_perc'], step=1.0)
+            imposto = st.number_input("Imposto Fixo (R$)", min_value=0.0, value=imposto_atual, step=10.0)
             if st.form_submit_button("Atualizar Valores", type="primary", use_container_width=True):
                 supabase.table("config").update({
                     "valor_hora": valor_h,
