@@ -484,8 +484,8 @@ elif menu == "📅 Agendamentos":
                     ag_info = get_agendamento_by_id(ag_id)
 
                     with st.form("form_gerar_os"):
-                        st.info("Informe o tempo total do serviço para gerar a OS (múltiplo de 15 minutos).")
-                        duracao = st.number_input("Tempo (min)", min_value=15, value=15, step=15)
+                        st.info("Informe o tempo total do serviço para gerar a OS (múltiplo de 15 minutos). Use 0 para registrar sem faturamento.")
+                        duracao = st.number_input("Tempo (min)", min_value=0, value=15, step=15)
 
                         min_reais_preview = float(duracao)
                         min_cobrados_preview = calcular_minutos_cobrados(min_reais_preview)
@@ -496,7 +496,7 @@ elif menu == "📅 Agendamentos":
 
                         if st.form_submit_button("Gerar OS e Concluir Agendamento", type="primary"):
                             min_reais = float(duracao)
-                            if min_reais > 0:
+                            if min_reais >= 0:
                                 min_cobrados = calcular_minutos_cobrados(min_reais)
 
                                 supabase.table("ordens_servico").insert({
@@ -552,14 +552,14 @@ elif menu == "🛠️ Ordens de Serviço":
                     data_os = c4.date_input("Data", date.today(), format="DD/MM/YYYY")
 
                     st.markdown("##### Tempo")
-                    duracao = st.number_input("Tempo (min)", min_value=15, value=15, step=15)
+                    duracao = st.number_input("Tempo (min)", min_value=0, value=15, step=15)
 
                     min_reais_preview = float(duracao)
                     min_cobrados_preview = calcular_minutos_cobrados(min_reais_preview)
                     hist = st.text_area("Descrição")
                     if st.form_submit_button("Lançar OS", type="primary", use_container_width=True):
                         min_reais = float(duracao)
-                        if min_reais > 0:
+                        if min_reais >= 0:
                             min_cobrados = calcular_minutos_cobrados(min_reais)
                             supabase.table("ordens_servico").insert({
                                 "cliente_id": int(opcoes_clientes[cli_sel]),
