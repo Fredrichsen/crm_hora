@@ -7,6 +7,11 @@ from datetime import datetime, date, timedelta
 from fpdf import FPDF
 import unicodedata
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 # dotenv pode não existir em Streamlit Cloud, então importamos com fallback
 try:
     from dotenv import load_dotenv
@@ -238,8 +243,14 @@ def preparar_texto_pdf(txt):
     return txt.encode('latin-1', 'ignore').decode('latin-1')
 
 
+def get_data_hora_local():
+    if ZoneInfo is not None:
+        return datetime.now(ZoneInfo("America/Sao_Paulo"))
+    return datetime.now()
+
+
 def adicionar_data_impressao_pdf(pdf):
-    data_impressao = datetime.now().strftime('%d/%m/%Y %H:%M')
+    data_impressao = get_data_hora_local().strftime('%d/%m/%Y %H:%M')
     pdf.set_font("Arial", '', 9)
     pdf.cell(0, 8, preparar_texto_pdf(f"Impresso em: {data_impressao}"), ln=True, align='R')
     pdf.ln(2)
@@ -370,7 +381,7 @@ if menu == "Visão Geral (Dashboard)":
     else:
         df_os['data_os'] = pd.to_datetime(df_os['data_os'])
         meses_disponiveis = sorted(df_os['data_os'].dt.strftime('%Y-%m').unique().tolist(), reverse=True)
-        mes_atual = datetime.now().strftime('%Y-%m')
+        mes_atual = get_data_hora_local().strftime('%Y-%m')
         indice_padrao = meses_disponiveis.index(mes_atual) if mes_atual in meses_disponiveis else 0
         mes_selecionado = st.selectbox(
             "Competência",
