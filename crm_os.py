@@ -243,6 +243,67 @@ def preparar_texto_pdf(txt):
     return txt.encode('latin-1', 'ignore').decode('latin-1')
 
 
+def sanitizar_nome_arquivo(txt):
+    if not txt:
+        return "arquivo"
+
+    txt = unicodedata.normalize('NFKD', str(txt)).encode('ASCII', 'ignore').decode('ASCII')
+    permitido = []
+    for char in txt:
+        if char.isalnum():
+            permitido.append(char)
+        elif char in {' ', '-', '_'}:
+            permitido.append('_')
+    nome = ''.join(permitido).strip('_')
+    while '__' in nome:
+        nome = nome.replace('__', '_')
+    return nome or "arquivo"
+
+
+def montar_nome_arquivo_exportacao(clientes_filtrados, referencia_formatada, resumido=False):
+    if len(clientes_filtrados) == 1:
+        empresa = clientes_filtrados[0]
+    elif len(clientes_filtrados) > 1:
+        empresa = "multiplas_empresas"
+    else:
+        empresa = "todos_clientes"
+
+    empresa_limpa = sanitizar_nome_arquivo(empresa)
+    referencia_limpa = referencia_formatada.replace('/', '-')
+    return f"{empresa_limpa}_{referencia_limpa}.pdf"
+
+
+def obter_nome_cliente_exportacao(clientes_filtrados):
+    if len(clientes_filtrados) == 1:
+        return clientes_filtrados[0]
+    if len(clientes_filtrados) > 1:
+        return "Múltiplas empresas"
+    return "Todos os clientes"
+
+
+def obter_titulo_exportacao(tipo_exportacao, clientes_filtrados):
+    return f"OS {tipo_exportacao} - {obter_nome_cliente_exportacao(clientes_filtrados)}"
+
+
+def formatar_mes_arquivo_ptbr(competencia):
+    meses = {
+        1: 'janeiro',
+        2: 'fevereiro',
+        3: 'marco',
+        4: 'abril',
+        5: 'maio',
+        6: 'junho',
+        7: 'julho',
+        8: 'agosto',
+        9: 'setembro',
+        10: 'outubro',
+        11: 'novembro',
+        12: 'dezembro',
+    }
+    data_competencia = datetime.strptime(competencia, '%Y-%m')
+    return f"{meses[data_competencia.month]}_{data_competencia.year}"
+
+
 def get_data_hora_local():
     if ZoneInfo is not None:
         return datetime.now(ZoneInfo("America/Sao_Paulo"))
@@ -349,6 +410,71 @@ def gerar_pdf_lista_os(titulo, subtitulo, df_os, valor_hora):
         pdf.multi_cell(0, 6, preparar_texto_pdf(historico))
         pdf.cell(0, 4, "", ln=True, border='B')
         pdf.ln(2)
+
+    pdf_output = pdf.output(dest='S')
+    return pdf_output if isinstance(pdf_output, bytes) else pdf_output.encode('latin-1')
+
+
+def formatar_lista_resumo(valores):
+    itens = []
+    for valor in valores:
+        texto = str(valor).strip()
+        if texto and texto.lower() != 'nan' and texto not in itens:
+            itens.append(texto)
+    return ", ".join(itens) if itens else "-"
+
+
+def gerar_pdf_lista_os_resumido(titulo, subtitulo, df_os, valor_hora):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    adicionar_data_impressao_pdf(pdf)
+
+    df_ordenado = df_os.copy()
+    df_ordenado['data_os'] = pd.to_datetime(df_ordenado['data_os'])
+    df_ordenado['minutos_cobrados'] = pd.to_numeric(df_ordenado['minutos_cobrados'], errors='coerce').fillna(0).astype(int)
+    df_ordenado = df_ordenado.sort_values(['data_os', 'id'])
+
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, preparar_texto_pdf(titulo), ln=True, align='C')
+    pdf.ln(3)
+
+    pdf.set_font("Arial", '', 11)
+    pdf.multi_cell(0, 7, preparar_texto_pdf(subtitulo))
+    pdf.ln(2)
+
+    for data_referencia, grupo in df_ordenado.groupby(df_ordenado['data_os'].dt.normalize(), sort=True):
+        data_formatada = data_referencia.strftime('%d/%m/%Y')
+        total_dia = int(grupo['minutos_cobrados'].sum())
+
+        pdf.set_font("Arial", 'B', 11)
+        pdf.cell(0, 8, preparar_texto_pdf(f"Data: {data_formatada} | Total do dia: {formatar_horas(total_dia)}"), ln=True)
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(0, 4, "", ln=True)
+
+        for _, row in grupo.iterrows():
+            cliente_nome = row.get('nome') or row.get('Cliente') or 'Sem cliente'
+            solicitante = row.get('solicitante') or '-'
+            tipo = row.get('tipo') or '-'
+            historico = row.get('historico') or '-'
+
+            pdf.set_font("Arial", 'B', 10)
+            pdf.cell(0, 6, preparar_texto_pdf(f"OS #{row['id']} - {cliente_nome}"), ln=True)
+            pdf.set_font("Arial", '', 10)
+            pdf.multi_cell(0, 6, preparar_texto_pdf(f"Solicitante: {solicitante} | Modalidade: {tipo}"))
+            pdf.set_font("Arial", 'B', 10)
+            pdf.cell(0, 6, preparar_texto_pdf("Histórico:"), ln=True)
+            pdf.set_font("Arial", '', 10)
+            pdf.multi_cell(0, 6, preparar_texto_pdf(historico))
+            pdf.ln(1)
+
+        pdf.cell(0, 4, "", ln=True, border='B')
+        pdf.ln(2)
+
+    total_minutos = int(df_ordenado['minutos_cobrados'].sum())
+    pdf.ln(2)
+    pdf.set_font("Arial", 'B', 11)
+    pdf.cell(0, 8, preparar_texto_pdf(f"Total de horas: {formatar_horas(total_minutos)}"), ln=True)
 
     pdf_output = pdf.output(dest='S')
     return pdf_output if isinstance(pdf_output, bytes) else pdf_output.encode('latin-1')
@@ -757,6 +883,12 @@ elif menu == "📄 Relatórios PDF":
 
         with aba_diario:
             st.markdown("Baixe todas as OS de um dia específico, com opção de filtrar por um ou mais clientes.")
+            modo_pdf_diario = st.radio(
+                "Formato do PDF diário",
+                ["Detalhado", "Resumido por dia"],
+                horizontal=True,
+                key="menu_pdf_modo_diario"
+            )
             pdf_data = st.date_input(
                 "Data do PDF diário",
                 value=max_date,
@@ -779,19 +911,34 @@ elif menu == "📄 Relatórios PDF":
                 st.info("Nenhuma OS encontrada para esse dia com os filtros selecionados.")
             else:
                 clientes_desc = ", ".join(pdf_clientes_dia) if pdf_clientes_dia else "Todos os clientes"
-                subtitulo_dia = f"Data: {pdf_data.strftime('%d/%m/%Y')}\nClientes: {clientes_desc}"
-                pdf_diario = gerar_pdf_lista_os("Relatório Diário de OS", subtitulo_dia, df_pdf_dia, config['valor_hora'])
+                titulo_diario = obter_titulo_exportacao("Diária", pdf_clientes_dia)
+                subtitulo_dia = f"Data: {pdf_data.strftime('%d/%m/%Y')}"
+                if len(pdf_clientes_dia) != 1:
+                    subtitulo_dia += f"\nClientes: {clientes_desc}"
+                referencia_diaria = pdf_data.strftime('%d/%m/%Y')
+                if modo_pdf_diario == "Resumido por dia":
+                    pdf_diario = gerar_pdf_lista_os_resumido(titulo_diario, subtitulo_dia, df_pdf_dia, config['valor_hora'])
+                    nome_arquivo_diario = montar_nome_arquivo_exportacao(pdf_clientes_dia, referencia_diaria, resumido=True)
+                else:
+                    pdf_diario = gerar_pdf_lista_os(titulo_diario, subtitulo_dia, df_pdf_dia, config['valor_hora'])
+                    nome_arquivo_diario = montar_nome_arquivo_exportacao(pdf_clientes_dia, referencia_diaria, resumido=False)
                 st.caption(f"{len(df_pdf_dia)} OS encontradas, totalizando {formatar_horas(df_pdf_dia['minutos_cobrados'].sum())}.")
                 st.download_button(
                     label="📥 Baixar PDF diário",
                     data=pdf_diario,
-                    file_name=f"OS_Diario_{pdf_data.strftime('%d-%m-%Y')}.pdf",
+                    file_name=nome_arquivo_diario,
                     mime="application/pdf",
                     key="menu_download_pdf_diario"
                 )
 
         with aba_mensal:
             st.markdown("Baixe todas as OS de uma competência, com filtro por múltiplos clientes.")
+            modo_pdf_mensal = st.radio(
+                "Formato do PDF mensal",
+                ["Detalhado", "Resumido por dia"],
+                horizontal=True,
+                key="menu_pdf_modo_mensal"
+            )
             mes_pdf = st.selectbox(
                 "Competência do PDF mensal",
                 options=meses_pdf,
@@ -812,13 +959,22 @@ elif menu == "📄 Relatórios PDF":
                 st.info("Nenhuma OS encontrada para essa competência com os filtros selecionados.")
             else:
                 clientes_desc = ", ".join(pdf_clientes_mes) if pdf_clientes_mes else "Todos os clientes"
-                subtitulo_mes = f"Competencia: {formatar_competencia(mes_pdf)}\nClientes: {clientes_desc}"
-                pdf_mensal = gerar_pdf_lista_os("Relatorio Mensal de OS", subtitulo_mes, df_pdf_mes, config['valor_hora'])
+                titulo_mensal = obter_titulo_exportacao("Mensal", pdf_clientes_mes)
+                subtitulo_mes = f"Competencia: {formatar_competencia(mes_pdf)}"
+                if len(pdf_clientes_mes) != 1:
+                    subtitulo_mes += f"\nClientes: {clientes_desc}"
+                referencia_mensal = formatar_mes_arquivo_ptbr(mes_pdf)
+                if modo_pdf_mensal == "Resumido por dia":
+                    pdf_mensal = gerar_pdf_lista_os_resumido(titulo_mensal, subtitulo_mes, df_pdf_mes, config['valor_hora'])
+                    nome_arquivo_mensal = montar_nome_arquivo_exportacao(pdf_clientes_mes, referencia_mensal, resumido=True)
+                else:
+                    pdf_mensal = gerar_pdf_lista_os(titulo_mensal, subtitulo_mes, df_pdf_mes, config['valor_hora'])
+                    nome_arquivo_mensal = montar_nome_arquivo_exportacao(pdf_clientes_mes, referencia_mensal, resumido=False)
                 st.caption(f"{len(df_pdf_mes)} OS encontradas, totalizando {formatar_horas(df_pdf_mes['minutos_cobrados'].sum())}.")
                 st.download_button(
                     label="📥 Baixar PDF mensal",
                     data=pdf_mensal,
-                    file_name=f"OS_Mensal_{formatar_competencia(mes_pdf).replace('/', '-')}.pdf",
+                    file_name=nome_arquivo_mensal,
                     mime="application/pdf",
                     key="menu_download_pdf_mensal"
                 )
